@@ -1,0 +1,35 @@
+#!/bin/bash
+# install_netops_env.sh
+sudo apt update && sudo apt install -y \
+  python3.11 python3.11-venv python3-pip \
+  git curl wget jq nmap tcpdump tshark \
+  openssh-client sshpass netcat-openbsd
+
+python3 -m venv ~/.venv/netops
+source ~/.venv/netops/bin/activate
+pip install ansible==9.1.0 ansible-lint yamllint \
+  netmiko napalm nornir nornir-netmiko \
+  ncclient requests pyyaml jinja2 \
+  pytest pytest-html rich click hvac \
+  pyang influxdb-client
+
+ansible-galaxy collection install cisco.ios cisco.nxos cisco.aci cisco.dnac
+
+curl -fsSL https://get.docker.com | bash
+sudo usermod -aG docker $USER
+
+curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+chmod +x minikube-linux-amd64 && sudo mv minikube-linux-amd64 /usr/local/bin/minikube
+minikube start --cpus=4 --memory=8192 --driver=docker
+
+docker pull frrouting/frr:latest python:3.12-slim \
+  batfish/allinone:latest prom/prometheus:latest grafana/grafana:latest
+
+
+
+Comptes à créer avant J1 :
+✅ developer.cisco.com   → Sandboxes DNAC, ACI, SD-WAN
+✅ gitlab.com            → Pipeline CI/CD
+✅ hub.docker.com        → Images Docker
