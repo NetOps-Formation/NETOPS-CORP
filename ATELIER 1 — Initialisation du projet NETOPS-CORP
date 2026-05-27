@@ -1,0 +1,206 @@
+🛠 ATELIER 1 — Initialisation du projet NETOPS-CORP
+
+Outils utilisés : Git, yamllint, ansible-lint, GitLab CI
+Objectif : Créer la structure complète du projet et le pipeline CI/CD
+
+*************************************************************************************************************************
+Étape 1 — Créer la structure du projet
+
+mkdir netops-corp && cd netops-corp
+git init
+
+# Structure professionnelle NetOps
+mkdir -p inventories/{production,staging}/{host_vars,group_vars}
+mkdir -p inventories/production/group_vars/{all,routers,switches,dc,branches}
+mkdir -p playbooks/{deploy,validate,rollback,diagnostics}
+mkdir -p roles group_vars/{all,routers,switches,dc,branches,wan}
+mkdir -p host_vars templates/{bgp,vlans,acl,ospf,sdwan,aci}
+mkdir -p tests/{pre_checks,post_checks,unit,lab}
+mkdir -p scripts/{inventory,monitoring,diag,perf,aci,sdwan}
+mkdir -p docs backups logs reports
+
+cat > .gitignore << 'EOF'
+*.retry
+.vault_pass
+vault_pass.txt
+*.pyc
+__pycache__/
+.env
+generated_configs/
+*.log
+backups/
+EOF
+
+cat > .yamllint.yml << 'EOF'
+extends: default
+rules:
+  line-length:
+    max: 120
+  truthy:
+    allowed-values: ['true', 'false']
+  comments:
+    min-spaces-from-content: 1
+EOF
+
+************************************************************************************************************************
+
+Étape 2 — Inventaire initial NETOPS-CORP
+
+# inventories/production/hosts.yml
+all:
+  children:
+    paris_hq:
+      hosts:
+        paris-rtr-01:
+          ansible_host: 10.0.1.1
+          ansible_network_os: cisco.ios.ios
+          site: paris
+          role: core_router
+        paris-sw-01:
+          ansible_host: 10.0.1.10
+          ansible_network_os: cisco.ios.ios
+          site: paris
+          role: distribution_switch
+
+    datacenters:
+      children:
+        dc1_lyon:
+          hosts:
+            dc1-border-01:
+              ansible_host: 10.1.1.1
+              ansible_network_os: cisco.nxos.nxos
+              site: dc1-lyon
+              role: border_leaf
+        dc2_marseille:
+          hosts:
+            dc2-border-01:
+              ansible_host: 10.2.1.1
+              ansible_network_os: cisco.nxos.nxos
+              site: dc2-marseille
+              role: border_leaf
+
+    branches:
+      hosts:
+        branch-bordeaux-vedge:
+          ansible_host: 10.10.1.1
+          ansible_network_os: cisco.ios.ios
+          site: bordeaux
+          role: vedge
+        branch-lille-vedge:
+          ansible_host: 10.10.2.1
+          ansible_network_os: cisco.ios.ios
+          site: lille
+          role: vedge
+        branch-stras-vedge:
+          ansible_host: 10.10.3.1
+          ansible_network_os: cisco.ios.ios
+          site: strasbourg
+          role: vedge
+
+  vars:
+    ansible_user: "{{ vault_ansible_user }}"
+    ansible_password: "{{ vault_ansible_password }}"
+    ansible_become: true
+    ansible_become_method: enable
+    ansible_become_pass: "{{ vault_enable_password }}"
+    ansible_connection: network_cli
+    ansible_timeout: 60
+
+*************************************************************************************************************************
+Étape 3 — Pipeline CI/CD GitLab
+# .gitlab-ci.yml
+stages:
+  - lint
+  - syntax_check
+  - test_lab
+  - deploy_staging
+  - validate_staging
+  - deploy_production
+
+variables:
+  ANSIBLE_FORCE_COLOR: "true"
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+
+lint_yaml:
+  stage: lint
+  image: pipelinecomponents/ansible-lint:latest
+  script:
+    - yamllint -c .yamllint.yml playbooks/ group_vars/ inventories/
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+lint_ansible:
+  stage: lint
+  image: pipelinecomponents/ansible-lint:latest
+  script:
+    - ansible-lint playbooks/
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+syntax_check:
+  stage: syntax_check
+  script:
+    - source ~/.venv/netops/bin/activate
+    - ansible-playbook playbooks/deploy/site.yml \
+        --syntax-check -i inventories/staging/
+
+test_lab:
+  stage: test_lab
+  script:
+    - docker compose -f tests/lab/docker-compose.yml up -d
+    - sleep 20
+    - ansible-playbook playbooks/deploy/site.yml \
+        -i tests/lab/inventory.yml --check
+    - docker compose -f tests/lab/docker-compose.yml down
+
+deploy_staging:
+  stage: deploy_staging
+  script:
+    - ansible-playbook playbooks/deploy/site.yml \
+        -i inventories/staging/ \
+        --vault-password-file .vault_pass
+  environment: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
+validate_staging:
+  stage: validate_staging
+  script:
+    - pytest tests/post_checks/ -v \
+        --html=reports/staging_report.html
+  artifacts:
+    paths: [reports/]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
+deploy_production:
+  stage: deploy_production
+  script:
+    - ansible-playbook playbooks/deploy/site.yml \
+        -i inventories/production/ \
+        --vault-password-file .vault_pass
+  environment: production
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+*****************************************************************************************************************************
+Étape 4 — Premier commit et validation
+
+# Valider la structure YAML avant de committer
+yamllint inventories/production/hosts.yml
+yamllint .gitlab-ci.yml
+
+# Premier commit
+git add .
+git commit -m "init: structure projet NETOPS-CORP
+
+- Inventaire production : Paris HQ + DC1/DC2 + 3 branches
+- Pipeline CI/CD : lint → test → staging → prod
+- Structure roles/playbooks/templates/tests"
+
+git remote add origin https://gitlab.com/<votre-user>/netops-corp.git
+git push -u origin main
+
+*****************************************************************************************************************************
+✅ Livrable J1-M1 : Dépôt Git NETOPS-CORP initialisé, pipeline CI/CD fonctionnel
