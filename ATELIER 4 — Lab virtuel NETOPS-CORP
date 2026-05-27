@@ -1,0 +1,210 @@
+🛠 ATELIER 4 — Lab virtuel NETOPS-CORP
+
+Outils utilisés : Docker, Docker Compose, FRRouting, Batfish
+Objectif : Démarrer le lab complet et valider la topologie BGP NETOPS-CORP
+
+************************************************************************************************************************
+Étape 1 — Docker Compose du lab
+
+# docker-compose.yml
+version: '3.9'
+
+services:
+  # ── Toolbox Ansible/Python ─────────────────────────
+  toolbox:
+    build: .
+    container_name: netops-toolbox
+    volumes:
+      - ./:/workspace
+      - ~/.ssh:/root/.ssh:ro
+    environment:
+      - ANSIBLE_HOST_KEY_CHECKING=False
+      - NET_USER=frr
+      - NET_PASS=frr
+    networks:
+      mgmt:
+        ipv4_address: 172.20.0.100
+
+  # ── Routeurs FRR (simulent l'infra NETOPS-CORP) ────
+  frr-paris:
+    image: frrouting/frr:latest
+    container_name: netops-frr-paris
+    privileged: true
+    hostname: paris-rtr-01
+    networks:
+      mgmt: {ipv4_address: 172.20.0.11}
+      wan:  {ipv4_address: 10.0.12.1}
+
+  frr-dc1:
+    image: frrouting/frr:latest
+    container_name: netops-frr-dc1
+    privileged: true
+    hostname: dc1-border-01
+    networks:
+      mgmt: {ipv4_address: 172.20.0.12}
+      wan:  {ipv4_address: 10.0.12.2}
+
+  frr-dc2:
+    image: frrouting/frr:latest
+    container_name: netops-frr-dc2
+    privileged: true
+    hostname: dc2-border-01
+    networks:
+      mgmt: {ipv4_address: 172.20.0.13}
+      wan:  {ipv4_address: 10.0.12.3}
+
+  frr-bordeaux:
+    image: frrouting/frr:latest
+    container_name: netops-frr-bordeaux
+    privileged: true
+    hostname: branch-bordeaux-vedge
+    networks:
+      mgmt:    {ipv4_address: 172.20.0.21}
+      sdwan:   {ipv4_address: 10.20.1.1}
+
+  # ── Batfish (analyse statique) ─────────────────────
+  batfish:
+    image: batfish/allinone:latest
+    container_name: netops-batfish
+    ports: ["9997:9997", "9996:9996"]
+    networks:
+      mgmt: {ipv4_address: 172.20.0.200}
+
+  # ── Monitoring ─────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: netops-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports: ["9090:9090"]
+    networks:
+      mgmt: {ipv4_address: 172.20.0.201}
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: netops-grafana
+    ports: ["3001:3000"]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=netops123
+    networks:
+      mgmt: {ipv4_address: 172.20.0.202}
+
+networks:
+  mgmt:
+    driver: bridge
+    ipam: {config: [{subnet: "172.20.0.0/24"}]}
+  wan:
+    driver: bridge
+    ipam: {config: [{subnet: "10.0.12.0/28"}]}
+  sdwan:
+    driver: bridge
+    ipam: {config: [{subnet: "10.20.0.0/16"}]}
+
+**************************************************************************************************************************
+Étape 2 — Démarrage et configuration BGP
+# Démarrer le lab
+docker compose up -d
+docker compose ps   # Vérifier que tous sont "Up"
+
+# Configurer BGP sur Paris HQ
+docker exec netops-frr-paris vtysh << 'EOF'
+configure terminal
+hostname paris-rtr-01
+!
+router bgp 65001
+  bgp router-id 10.0.12.1
+  bgp log-neighbor-changes
+  neighbor 10.0.12.2 remote-as 65002
+  neighbor 10.0.12.2 description DC1-Lyon
+  neighbor 10.0.12.3 remote-as 65003
+  neighbor 10.0.12.3 description DC2-Marseille
+  !
+  address-family ipv4 unicast
+    network 10.0.1.0/24
+    neighbor 10.0.12.2 activate
+    neighbor 10.0.12.3 activate
+  exit-address-family
+end
+write memory
+EOF
+
+# Configurer BGP sur DC1
+docker exec netops-frr-dc1 vtysh << 'EOF'
+configure terminal
+hostname dc1-border-01
+router bgp 65002
+  bgp router-id 10.0.12.2
+  neighbor 10.0.12.1 remote-as 65001
+  neighbor 10.0.12.1 description Paris-HQ
+  address-family ipv4 unicast
+    network 10.1.0.0/16
+    neighbor 10.0.12.1 activate
+  exit-address-family
+end
+write memory
+EOF
+
+# Configurer BGP sur DC2
+docker exec netops-frr-dc2 vtysh << 'EOF'
+configure terminal
+hostname dc2-border-01
+router bgp 65003
+  bgp router-id 10.0.12.3
+  neighbor 10.0.12.1 remote-as 65001
+  neighbor 10.0.12.1 description Paris-HQ
+  address-family ipv4 unicast
+    network 10.2.0.0/16
+    neighbor 10.0.12.1 activate
+  exit-address-family
+end
+write memory
+EOF
+
+*******************************************************************************************************************************************
+Étape 3 — Validation de la topologie
+# Vérifier les sessions BGP
+echo "=== BGP Summary — Paris ==="
+docker exec netops-frr-paris vtysh -c "show bgp summary"
+# Expected : dc1 (10.0.12.2) et dc2 (10.0.12.3) en état "Established"
+
+echo "=== Routes BGP reçues ==="
+docker exec netops-frr-paris vtysh -c "show bgp ipv4 unicast"
+# Expected : routes 10.1.0.0/16 (DC1) et 10.2.0.0/16 (DC2) présentes
+
+echo "=== Connectivité end-to-end ==="
+docker exec netops-frr-paris ping -c 3 10.0.12.2
+docker exec netops-frr-paris ping -c 3 10.0.12.3
+
+# Inventaire Ansible pour le lab
+cat > tests/lab/inventory.yml << 'EOF'
+all:
+  hosts:
+    lab-paris:
+      ansible_host: 172.20.0.11
+      site: paris
+      role: core_router
+    lab-dc1:
+      ansible_host: 172.20.0.12
+      site: dc1-lyon
+      role: border_leaf
+    lab-dc2:
+      ansible_host: 172.20.0.13
+      site: dc2-marseille
+      role: border_leaf
+    lab-bordeaux:
+      ansible_host: 172.20.0.21
+      site: bordeaux
+      role: vedge
+  vars:
+    ansible_user: frr
+    ansible_connection: network_cli
+    ansible_network_os: frr
+EOF
+
+# Test Ansible sur le lab
+ansible -i tests/lab/inventory.yml all -m ping
+
+*********************************************************************************************************************************************************
+Livrable J1-M4 : Lab virtuel NETOPS-CORP opérationnel, BGP Paris↔DC1↔DC2 établi
+
+
