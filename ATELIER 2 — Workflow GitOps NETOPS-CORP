@@ -1,0 +1,65 @@
+🛠 ATELIER 2 — Workflow GitOps NETOPS-CORP
+
+Outils utilisés : Git, yamllint, ansible-lint
+Objectif : Simuler un workflow GitOps complet pour l'ajout du VLAN 300 DMZ
+
+# 1. Partir de main et créer la branche feature
+git checkout main
+git pull origin main
+git checkout -b feature/vlan-300-dmz-paris-dc
+
+# 2. Ajouter le VLAN 300 dans la source de vérité
+cat > group_vars/all/vlans.yml << 'EOF'
+---
+vlans:
+  - id: 100
+    name: PROD_SERVERS
+    description: "Serveurs de production NETOPS-CORP"
+  - id: 200
+    name: MGMT_OOB
+    description: "Management Out-of-Band"
+  - id: 300
+    name: DMZ_INTERNET
+    description: "Zone DMZ — Ticket NETOPS-47"
+    tagged_on: [paris_hq, dc1_lyon, dc2_marseille]
+  - id: 400
+    name: BRANCH_USERS
+    description: "Utilisateurs branches SD-WAN"
+EOF
+
+# 3. Valider la qualité avant de committer
+yamllint group_vars/all/vlans.yml
+echo "YAML valide"
+
+# 4. Vérifier qu'on ne commit pas de secrets
+git diff --staged | grep -iE "(password|secret|token|key)" \
+  && echo "Possible secret détecté !" \
+  || echo "Pas de secret apparent"
+
+# 5. Committer avec un message structuré
+git add group_vars/all/vlans.yml
+git commit -m "feat(vlan): add VLAN 300 DMZ pour Paris HQ et datacenters
+
+- VLAN 300 : DMZ_INTERNET
+- Scope : paris_hq + dc1_lyon + dc2_marseille (pas les branches)
+- Contexte : projet sécurisation DMZ Q1 2025
+- Ticket : NETOPS-47
+- Testé en lab : à faire dans cette MR"
+
+git push origin feature/vlan-300-dmz-paris-dc
+# → Ouvrir une Merge Request sur GitLab
+# → Demander une revue à un collègue
+
+**********************************************************************************************************************
+
+Convention de branches NETOPS-CORP :
+
+feature/<composant>-<description>  → feature/bgp-peer-dc2-wan
+fix/<équipement>-<problème>        → fix/paris-rtr-01-ospf-timer
+hotfix/<urgence>                   → hotfix/branch-bordeaux-down
+release/v<X.Y.Z>                   → release/v1.3.0
+***********************************************************************************************************************
+Livrable J1-M2 : Convention GitOps documentée, workflow Merge Request opérationnel
+
+
+
