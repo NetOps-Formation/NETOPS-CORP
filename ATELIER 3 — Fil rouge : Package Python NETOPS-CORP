@@ -1,0 +1,377 @@
+🛠 ATELIER 3 — Fil rouge : Package Python NETOPS-CORP
+
+Outils utilisés : Python 3.11, netmiko, rich, pytest
+Objectif : Construire le package Python qui sera utilisé dans tous les ateliers suivants
+
+**********************************************************************************************************************
+Étape 1 — Structure du package
+bashmkdir -p netops_corp/{devices,api,checks,utils}
+touch netops_corp/__init__.py
+touch netops_corp/{devices,api,checks,utils}/__init__.py
+
+cat > setup.py << 'EOF'
+from setuptools import setup, find_packages
+setup(
+    name="netops-corp",
+    version="0.1.0",
+    packages=find_packages(),
+    install_requires=[
+        "netmiko", "napalm", "requests",
+        "pyyaml", "jinja2", "rich", "click"
+    ],
+)
+EOF
+
+pip install -e .   # Installation en mode éditable
+
+***********************************************************************************************************************
+Étape 2 — Classe de base
+
+# netops_corp/devices/base.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+import logging
+
+@dataclass
+class DeviceCredentials:
+    hostname: str
+    username: str
+    password: str
+    enable_password: Optional[str] = None
+    port: int = 22
+    timeout: int = 30
+    site: str = "unknown"
+    role: str = "unknown"
+
+class NetworkDevice(ABC):
+    """
+    Classe abstraite représentant un équipement réseau NETOPS-CORP.
+    
+    Pourquoi abstraite ?
+    - Garantir que TOUS les équipements exposent la même interface
+    - Permettre au code métier de ne pas savoir si c'est IOS, NX-OS, ou FRR
+    - Faciliter les tests (on peut mocker cette classe)
+    """
+    def __init__(self, creds: DeviceCredentials):
+        self.creds = creds
+        self.logger = logging.getLogger(
+            f"{self.__class__.__name__}[{creds.hostname}]"
+        )
+        self._conn = None
+
+    @abstractmethod
+    def connect(self) -> bool:
+        """Établit la connexion. Lève une exception si impossible."""
+        pass
+
+    @abstractmethod
+    def disconnect(self) -> None:
+        pass
+
+    @abstractmethod
+    def get_interfaces(self) -> list[dict]:
+        """
+        Retourne les interfaces sous forme standardisée :
+        [{"name": "Gi0/0", "status": "connected", "speed": 1000}, ...]
+        """
+        pass
+
+    @abstractmethod
+    def get_bgp_summary(self) -> list[dict]:
+        pass
+
+    @abstractmethod
+    def push_config(self, config: str) -> bool:
+        pass
+
+    @abstractmethod
+    def save_config(self) -> bool:
+        pass
+
+    # Context manager : permet d'utiliser "with CiscoIOS(...) as dev:"
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+        # Ne pas supprimer l'exception si elle existe
+        return False
+
+******************************************************************************************************************************
+Étape 3 — Implémentation Cisco IOS
+
+# netops_corp/devices/cisco_ios.py
+from netmiko import (ConnectHandler,
+                     NetmikoTimeoutException,
+                     NetmikoAuthenticationException)
+from .base import NetworkDevice, DeviceCredentials
+import time
+
+class CiscoIOS(NetworkDevice):
+    """
+    Implémentation pour les équipements Cisco IOS/IOS-XE.
+    Utilisé pour : Paris HQ, branches SD-WAN NETOPS-CORP
+    """
+
+    MAX_RETRIES = 3
+    RETRY_DELAY = 5
+
+    def connect(self) -> bool:
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._conn = ConnectHandler(
+                    device_type='cisco_ios',
+                    host=self.creds.hostname,
+                    username=self.creds.username,
+                    password=self.creds.password,
+                    secret=self.creds.enable_password or self.creds.password,
+                    port=self.creds.port,
+                    timeout=self.creds.timeout
+                )
+                self._conn.enable()
+                self.logger.info(
+                    f"Connecté ({self.creds.site}/{self.creds.role})"
+                )
+                return True
+            except NetmikoAuthenticationException:
+                # Pas de retry sur une erreur d'authentification
+                self.logger.error("Échec authentification — vérifier les credentials")
+                raise
+            except NetmikoTimeoutException:
+                if attempt < self.MAX_RETRIES - 1:
+                    wait = self.RETRY_DELAY * (attempt + 1)
+                    self.logger.warning(
+                        f"Timeout (tentative {attempt+1}/{self.MAX_RETRIES})"
+                        f" — retry dans {wait}s"
+                    )
+                    time.sleep(wait)
+                else:
+                    self.logger.error(f"Timeout après {self.MAX_RETRIES} tentatives")
+                    raise
+
+    def disconnect(self) -> None:
+        if self._conn:
+            self._conn.disconnect()
+            self.logger.info("Déconnecté")
+
+    def get_interfaces(self) -> list[dict]:
+        """Utilise TextFSM pour parser la sortie en structure Python."""
+        raw = self._conn.send_command(
+            'show interfaces status', use_textfsm=True
+        )
+        return raw if isinstance(raw, list) else []
+
+    def get_bgp_summary(self) -> list[dict]:
+        raw = self._conn.send_command(
+            'show bgp summary', use_textfsm=True
+        )
+        return raw if isinstance(raw, list) else []
+
+    def push_config(self, config: str) -> bool:
+        commands = [l for l in config.splitlines() if l.strip()]
+        output = self._conn.send_config_set(commands)
+        self.logger.info(f"Config appliquée ({len(commands)} commandes)")
+        return True
+
+    def save_config(self) -> bool:
+        self._conn.save_config()
+        self.logger.info("Config sauvegardée en NVRAM")
+        return True
+
+*************************************************************************************************************************************************
+Étape 4 — Logger centralisé
+
+# netops_corp/utils/logger.py
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
+    """
+    Logger configuré pour la production NETOPS-CORP :
+    - Console : WARNING et au-dessus (pour ne pas noyer l'opérateur)
+    - Fichier  : INFO et au-dessus avec rotation (10 Mo, 5 fichiers)
+    """
+    Path("logs").mkdir(exist_ok=True)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)   # Capturer tout au niveau du logger
+
+    fmt = logging.Formatter(
+        '%(asctime)s | %(name)-35s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Console : WARNING+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(fmt)
+
+    # Fichier : INFO+ avec rotation
+    fh = RotatingFileHandler(
+        'logs/netops_corp.log',
+        maxBytes=10*1024*1024,
+        backupCount=5
+    )
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+************************************************************************************************************************************************************
+Étape 5 — Script de collecte d'état (fil rouge)
+
+#!/usr/bin/env python3
+# scripts/inventory/collect_state.py
+"""
+Collecte l'état de tous les équipements NETOPS-CORP
+Usage : python3 scripts/inventory/collect_state.py
+"""
+import yaml, json, os
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress
+from netops_corp.devices.cisco_ios import CiscoIOS
+from netops_corp.devices.base import DeviceCredentials
+from netops_corp.utils.logger import setup_logger
+
+logger = setup_logger("collect_state")
+console = Console()
+
+def load_hosts_from_inventory(path: str) -> list[dict]:
+    """Extrait les hosts de l'inventaire Ansible."""
+    with open(path) as f:
+        inv = yaml.safe_load(f)
+
+    hosts = []
+    def walk(node):
+        if "hosts" in node:
+            for name, hvars in node["hosts"].items():
+                hosts.append({
+                    "hostname": name,
+                    "host":     hvars.get("ansible_host", name),
+                    "site":     hvars.get("site", "unknown"),
+                    "role":     hvars.get("role", "unknown"),
+                    "os":       hvars.get("ansible_network_os", "cisco.ios.ios"),
+                })
+        if "children" in node:
+            for child in node["children"].values():
+                walk(child)
+
+    walk(inv["all"])
+    return hosts
+
+def collect_one_device(device: dict) -> dict:
+    """Collecte l'état d'un seul équipement. Ne lève jamais d'exception."""
+    result = {
+        "hostname":        device["hostname"],
+        "site":            device["site"],
+        "role":            device["role"],
+        "status":          "unknown",
+        "interfaces_up":   0,
+        "interfaces_down": 0,
+        "bgp_peers_up":    0,
+        "bgp_peers_down":  0,
+        "error":           None,
+    }
+    try:
+        creds = DeviceCredentials(
+            hostname=device["host"],
+            username=os.environ.get("NET_USER", "devnetuser"),
+            password=os.environ.get("NET_PASS", "Cisco123!"),
+            enable_password=os.environ.get("NET_ENABLE", "Cisco123!"),
+            site=device["site"],
+            role=device["role"],
+            timeout=20
+        )
+        with CiscoIOS(creds) as dev:
+            ifaces = dev.get_interfaces()
+            if isinstance(ifaces, list):
+                result["interfaces_up"] = sum(
+                    1 for i in ifaces if i.get("status") == "connected"
+                )
+                result["interfaces_down"] = sum(
+                    1 for i in ifaces if i.get("status") != "connected"
+                )
+            bgp = dev.get_bgp_summary()
+            if isinstance(bgp, list):
+                result["bgp_peers_up"] = sum(
+                    1 for p in bgp
+                    if str(p.get("state_pfxrcd","")).isdigit()
+                )
+                result["bgp_peers_down"] = sum(
+                    1 for p in bgp
+                    if not str(p.get("state_pfxrcd","")).isdigit()
+                )
+            result["status"] = "OK"
+    except Exception as e:
+        result["status"] = "ERREUR"
+        result["error"]  = str(e)[:80]
+        logger.error(f"{device['hostname']} — {e}")
+
+    return result
+
+def display_and_save(results: list[dict]):
+    table = Table(
+        title="État Infrastructure NETOPS-CORP",
+        show_lines=True
+    )
+    table.add_column("Équipement",  style="bold cyan")
+    table.add_column("Site",        style="blue")
+    table.add_column("Rôle")
+    table.add_column("Statut",      justify="center")
+    table.add_column("IF ↑/↓",      justify="center")
+    table.add_column("BGP ↑/↓",     justify="center")
+
+    for r in sorted(results, key=lambda x: (x["site"], x["hostname"])):
+        status_str = "OK" if r["status"] == "OK" else f"{r['status']}"
+        bgp = f"{r['bgp_peers_up']}/{r['bgp_peers_down']}" \
+              if r["bgp_peers_up"] + r["bgp_peers_down"] > 0 else "N/A"
+        table.add_row(
+            r["hostname"], r["site"], r["role"], status_str,
+            f"{r['interfaces_up']}/{r['interfaces_down']}",
+            bgp
+        )
+
+    console.print(table)
+
+    # Sauvegarde JSON
+    Path("reports").mkdir(exist_ok=True)
+    fname = f"reports/state_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    with open(fname, "w") as f:
+        json.dump(results, f, indent=2)
+    console.print(f"\nRapport : {fname}")
+
+if __name__ == "__main__":
+    console.print("[bold]Collecte état NETOPS-CORP...[/bold]\n")
+    hosts = load_hosts_from_inventory("inventories/production/hosts.yml")
+    console.print(f"   {len(hosts)} équipements dans l'inventaire\n")
+
+    results = []
+    with Progress() as progress:
+        task = progress.add_task(
+            "Interrogation...", total=len(hosts)
+        )
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(collect_one_device, h): h
+                for h in hosts
+            }
+            for future in as_completed(futures):
+                results.append(future.result())
+                progress.advance(task)
+
+    display_and_save(results)
+
+******************************************************************************************************************************************
+
+Livrable J1-M3 : Package Python netops_corp + script de collecte parallèle
+
+
